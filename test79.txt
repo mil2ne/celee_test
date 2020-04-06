@@ -1,2 +1,5 @@
 AWS Access Key ID [None]: ABCDEF
 AWS Secret Access Key [None]: GHIJKL
+password=1234
+key=1234
+line=hanpda
