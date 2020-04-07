@@ -1,1 +1,1 @@
-u = hanpda 
+u = xxx.hanpda.com
