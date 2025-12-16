@@ -98,6 +98,235 @@ app.config['JSON_SORT_KEYS'] = False
 API_PORT = int(os.environ.get('HEXSTRIKE_PORT', 8888))
 API_HOST = os.environ.get('HEXSTRIKE_HOST', '127.0.0.1')
 
+# Temporary File Management Configuration
+HEXSTRIKE_BASE_DIR = os.environ.get('HEXSTRIKE_BASE_DIR', '/home/log/hexstrike')
+HEXSTRIKE_OUTPUT_DIR = os.path.join(HEXSTRIKE_BASE_DIR, 'outputs')
+HEXSTRIKE_SCREENSHOT_DIR = os.path.join(HEXSTRIKE_BASE_DIR, 'screenshots')
+HEXSTRIKE_ENVS_DIR = os.path.join(HEXSTRIKE_BASE_DIR, 'envs')
+HEXSTRIKE_FILES_DIR = os.path.join(HEXSTRIKE_BASE_DIR, 'files')
+
+# ============================================================================
+# TEMPORARY FILE MANAGER (v6.1 ENHANCEMENT)
+# ============================================================================
+
+class TempFileManager:
+    """
+    Centralized temporary file and directory management.
+    Handles automatic cleanup after scan completion to prevent /tmp disk exhaustion.
+    """
+
+    def __init__(self):
+        self.base_dir = Path(HEXSTRIKE_BASE_DIR)
+        self.output_dir = Path(HEXSTRIKE_OUTPUT_DIR)
+        self.screenshot_dir = Path(HEXSTRIKE_SCREENSHOT_DIR)
+        self._ensure_directories()
+        self.cleanup_lock = threading.Lock()
+
+    def _ensure_directories(self):
+        """Create base directories if they don't exist"""
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"📁 TempFileManager initialized: {self.base_dir}")
+        except PermissionError as e:
+            logger.warning(f"⚠️ Cannot create directory {self.base_dir}: {e}. Falling back to /tmp")
+            self.base_dir = Path("/tmp/hexstrike")
+            self.output_dir = Path("/tmp/hexstrike/outputs")
+            self.screenshot_dir = Path("/tmp/hexstrike/screenshots")
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_tool_output_dir(self, tool_name: str, session_id: str = None) -> Path:
+        """
+        Create and return a unique output directory for a tool.
+
+        Args:
+            tool_name: Name of the security tool
+            session_id: Optional session identifier (defaults to timestamp)
+
+        Returns:
+            Path to the tool's output directory
+        """
+        session_id = session_id or str(int(time.time()))
+        output_dir = self.output_dir / f"{tool_name}_{session_id}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"📂 Created output dir: {output_dir}")
+        return output_dir
+
+    def get_screenshot_path(self, prefix: str = "screenshot") -> Path:
+        """Get a unique screenshot file path"""
+        timestamp = int(time.time())
+        return self.screenshot_dir / f"{prefix}_{timestamp}.png"
+
+    def cleanup_output(self, output_path: Path) -> Dict[str, Any]:
+        """
+        Immediately delete an output directory or file after scan completion.
+
+        Args:
+            output_path: Path to the output directory or file to clean
+
+        Returns:
+            Dict with cleanup status
+        """
+        with self.cleanup_lock:
+            try:
+                if not output_path.exists():
+                    return {"success": True, "message": "Path does not exist"}
+
+                if output_path.is_dir():
+                    shutil.rmtree(output_path)
+                    logger.info(f"🧹 Cleaned directory: {output_path}")
+                else:
+                    output_path.unlink()
+                    logger.info(f"🧹 Cleaned file: {output_path}")
+
+                return {"success": True, "cleaned": str(output_path)}
+            except Exception as e:
+                logger.error(f"❌ Cleanup failed for {output_path}: {e}")
+                return {"success": False, "error": str(e)}
+
+    def cleanup_old_outputs(self, max_age_hours: int = 24) -> Dict[str, Any]:
+        """
+        Clean up output directories older than specified hours.
+
+        Args:
+            max_age_hours: Maximum age in hours before cleanup
+
+        Returns:
+            Dict with cleanup statistics
+        """
+        with self.cleanup_lock:
+            cleaned_count = 0
+            cleaned_size = 0
+            errors = []
+            cutoff_time = time.time() - (max_age_hours * 3600)
+
+            try:
+                for path in self.output_dir.iterdir():
+                    try:
+                        if path.stat().st_mtime < cutoff_time:
+                            size = self._get_dir_size(path) if path.is_dir() else path.stat().st_size
+                            if path.is_dir():
+                                shutil.rmtree(path)
+                            else:
+                                path.unlink()
+                            cleaned_count += 1
+                            cleaned_size += size
+                    except Exception as e:
+                        errors.append({"path": str(path), "error": str(e)})
+
+                logger.info(f"🧹 Cleanup completed: {cleaned_count} items, {cleaned_size / 1024 / 1024:.2f} MB freed")
+                return {
+                    "success": True,
+                    "cleaned_count": cleaned_count,
+                    "cleaned_size_mb": round(cleaned_size / 1024 / 1024, 2),
+                    "errors": errors
+                }
+            except Exception as e:
+                logger.error(f"❌ Cleanup error: {e}")
+                return {"success": False, "error": str(e)}
+
+    def emergency_cleanup(self) -> Dict[str, Any]:
+        """
+        Emergency cleanup when disk space is critically low.
+        Removes all outputs regardless of age, oldest first.
+
+        Returns:
+            Dict with cleanup statistics
+        """
+        logger.warning("🚨 Emergency cleanup triggered due to low disk space!")
+        with self.cleanup_lock:
+            cleaned_count = 0
+            cleaned_size = 0
+
+            try:
+                # Get all items sorted by modification time (oldest first)
+                items = []
+                for path in self.output_dir.iterdir():
+                    try:
+                        items.append((path, path.stat().st_mtime))
+                    except Exception:
+                        continue
+
+                items.sort(key=lambda x: x[1])  # Sort by mtime, oldest first
+
+                # Delete until we've freed at least 500MB or deleted everything
+                target_free = 500 * 1024 * 1024  # 500MB
+
+                for path, _ in items:
+                    if cleaned_size >= target_free:
+                        break
+                    try:
+                        size = self._get_dir_size(path) if path.is_dir() else path.stat().st_size
+                        if path.is_dir():
+                            shutil.rmtree(path)
+                        else:
+                            path.unlink()
+                        cleaned_count += 1
+                        cleaned_size += size
+                    except Exception as e:
+                        logger.error(f"❌ Failed to delete {path}: {e}")
+
+                # Also clean screenshots
+                for screenshot in self.screenshot_dir.iterdir():
+                    try:
+                        size = screenshot.stat().st_size
+                        screenshot.unlink()
+                        cleaned_count += 1
+                        cleaned_size += size
+                    except Exception:
+                        continue
+
+                logger.info(f"🚨 Emergency cleanup completed: {cleaned_count} items, {cleaned_size / 1024 / 1024:.2f} MB freed")
+                return {
+                    "success": True,
+                    "emergency": True,
+                    "cleaned_count": cleaned_count,
+                    "cleaned_size_mb": round(cleaned_size / 1024 / 1024, 2)
+                }
+            except Exception as e:
+                logger.error(f"❌ Emergency cleanup failed: {e}")
+                return {"success": False, "error": str(e)}
+
+    def get_disk_usage(self) -> Dict[str, Any]:
+        """Get current disk usage statistics"""
+        try:
+            disk = psutil.disk_usage(str(self.base_dir))
+            output_size = self._get_dir_size(self.output_dir)
+            screenshot_size = self._get_dir_size(self.screenshot_dir)
+
+            return {
+                "base_dir": str(self.base_dir),
+                "disk_total_gb": round(disk.total / 1024 / 1024 / 1024, 2),
+                "disk_used_gb": round(disk.used / 1024 / 1024 / 1024, 2),
+                "disk_free_gb": round(disk.free / 1024 / 1024 / 1024, 2),
+                "disk_percent": disk.percent,
+                "hexstrike_output_mb": round(output_size / 1024 / 1024, 2),
+                "hexstrike_screenshot_mb": round(screenshot_size / 1024 / 1024, 2),
+                "is_critical": disk.percent > 90
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _get_dir_size(self, path: Path) -> int:
+        """Calculate total size of a directory"""
+        total = 0
+        try:
+            if path.is_file():
+                return path.stat().st_size
+            for entry in path.rglob('*'):
+                if entry.is_file():
+                    total += entry.stat().st_size
+        except Exception:
+            pass
+        return total
+
+
+# Initialize global TempFileManager instance
+temp_file_manager = TempFileManager()
+
 # ============================================================================
 # MODERN VISUAL ENGINE (v2.0 ENHANCEMENT)
 # ============================================================================
@@ -1290,8 +1519,8 @@ class IntelligentDecisionEngine:
             params["port_scans"] = "top-1000-ports"
             params["timeout"] = 600
 
-        # Set output directory
-        params["output_dir"] = f"/tmp/autorecon_{profile.target.replace('.', '_')}"
+        # v6.1: Set output directory using managed base path
+        params["output_dir"] = f"{HEXSTRIKE_OUTPUT_DIR}/autorecon_{profile.target.replace('.', '_')}"
 
         return params
 
@@ -1382,9 +1611,9 @@ class IntelligentDecisionEngine:
         if context.get("aws_region"):
             params["region"] = context["aws_region"]
 
-        # Set output format and directory
+        # v6.1: Set output format and directory using managed base path
         params["output_format"] = "json"
-        params["output_dir"] = f"/tmp/prowler_{params['provider']}"
+        params["output_dir"] = f"{HEXSTRIKE_OUTPUT_DIR}/prowler_{params['provider']}"
 
         return params
 
@@ -1400,8 +1629,8 @@ class IntelligentDecisionEngine:
         if params["provider"] == "aws" and context.get("aws_profile"):
             params["profile"] = context["aws_profile"]
 
-        # Set report directory
-        params["report_dir"] = f"/tmp/scout-suite_{params['provider']}"
+        # v6.1: Set report directory using managed base path
+        params["report_dir"] = f"{HEXSTRIKE_OUTPUT_DIR}/scout-suite_{params['provider']}"
 
         return params
 
@@ -1578,6 +1807,7 @@ class RecoveryAction(Enum):
     ESCALATE_TO_HUMAN = "escalate_to_human"
     GRACEFUL_DEGRADATION = "graceful_degradation"
     ABORT_OPERATION = "abort_operation"
+    EMERGENCY_CLEANUP = "emergency_cleanup"  # v6.1: Disk space cleanup for RESOURCE_EXHAUSTED
 
 @dataclass
 class ErrorContext:
@@ -1778,6 +2008,14 @@ class IntelligentErrorHandler:
                 )
             ],
             ErrorType.RESOURCE_EXHAUSTED: [
+                RecoveryStrategy(
+                    action=RecoveryAction.EMERGENCY_CLEANUP,  # v6.1: Try cleanup first
+                    parameters={"force": True, "target_free_mb": 500},
+                    max_attempts=1,
+                    backoff_multiplier=1.0,
+                    success_probability=0.9,
+                    estimated_time=5
+                ),
                 RecoveryStrategy(
                     action=RecoveryAction.RETRY_WITH_REDUCED_SCOPE,
                     parameters={"reduce_memory": True, "reduce_threads": True},
@@ -5705,9 +5943,10 @@ class ProcessManager:
 class PythonEnvironmentManager:
     """Manage Python virtual environments and dependencies"""
 
-    def __init__(self, base_dir: str = "/tmp/hexstrike_envs"):
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(exist_ok=True)
+    def __init__(self, base_dir: str = None):
+        # v6.1: Use configurable base directory instead of hardcoded /tmp
+        self.base_dir = Path(base_dir) if base_dir else Path(HEXSTRIKE_ENVS_DIR)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def create_venv(self, env_name: str) -> Path:
         """Create a new virtual environment"""
@@ -8774,6 +9013,28 @@ def execute_command_with_recovery(tool_name: str, command: str, parameters: Dict
                 logger.info(f"🔧 Retrying {tool_name} with adjusted parameters")
                 continue
 
+            elif recovery_strategy.action == RecoveryAction.EMERGENCY_CLEANUP:
+                # v6.1: Emergency cleanup for disk space issues
+                logger.warning(f"🚨 Attempting emergency cleanup for {tool_name} due to resource exhaustion")
+                cleanup_result = temp_file_manager.emergency_cleanup()
+
+                if cleanup_result.get("success"):
+                    freed_mb = cleanup_result.get("cleaned_size_mb", 0)
+                    logger.info(f"🧹 Emergency cleanup freed {freed_mb} MB")
+
+                    recovery_history.append({
+                        "action": "emergency_cleanup",
+                        "freed_mb": freed_mb,
+                        "cleaned_count": cleanup_result.get("cleaned_count", 0),
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+                    # Continue to retry after cleanup
+                    continue
+                else:
+                    logger.error(f"❌ Emergency cleanup failed: {cleanup_result.get('error')}")
+                    # Fall through to next recovery strategy
+
             elif recovery_strategy.action == RecoveryAction.ESCALATE_TO_HUMAN:
                 # Create error context for escalation
                 error_context = ErrorContext(
@@ -8928,9 +9189,10 @@ def _determine_operation_type(tool_name: str) -> str:
 class FileOperationsManager:
     """Handle file operations with security and validation"""
 
-    def __init__(self, base_dir: str = "/tmp/hexstrike_files"):
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(exist_ok=True)
+    def __init__(self, base_dir: str = None):
+        # v6.1: Use configurable base directory instead of hardcoded /tmp
+        self.base_dir = Path(base_dir) if base_dir else Path(HEXSTRIKE_FILES_DIR)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
         self.max_file_size = 100 * 1024 * 1024  # 100MB
 
     def create_file(self, filename: str, content: str, binary: bool = False) -> Dict[str, Any]:
@@ -9133,6 +9395,93 @@ def health_check():
         "telemetry": telemetry.get_stats(),
         "uptime": time.time() - telemetry.stats["start_time"]
     })
+
+# ============================================================================
+# v6.1: CLEANUP API ENDPOINTS
+# ============================================================================
+
+@app.route("/api/cleanup/temp", methods=["POST"])
+def cleanup_temp_files():
+    """
+    Manually trigger cleanup of temporary files.
+
+    Request body (optional):
+    {
+        "emergency": bool - Force emergency cleanup (default: false)
+        "max_age_hours": int - Clean files older than this (default: 24)
+        "tool_name": str - Clean only specific tool output (optional)
+    }
+    """
+    try:
+        params = request.json or {}
+        emergency = params.get("emergency", False)
+        max_age_hours = params.get("max_age_hours", 24)
+        tool_name = params.get("tool_name")
+
+        if emergency:
+            logger.warning("🚨 Emergency cleanup triggered via API")
+            result = temp_file_manager.emergency_cleanup()
+        elif tool_name:
+            logger.info(f"🧹 Cleanup triggered for tool: {tool_name}")
+            tool_output_dir = temp_file_manager.output_dir / tool_name
+            if tool_output_dir.exists():
+                result = temp_file_manager.cleanup_output(tool_output_dir)
+            else:
+                result = {"success": True, "message": f"No output found for {tool_name}"}
+        else:
+            logger.info(f"🧹 Cleanup triggered for files older than {max_age_hours} hours")
+            result = temp_file_manager.cleanup_old_outputs(max_age_hours=max_age_hours)
+
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"💥 Error in cleanup endpoint: {str(e)}")
+        return jsonify({"error": f"Cleanup failed: {str(e)}"}), 500
+
+@app.route("/api/cleanup/status", methods=["GET"])
+def cleanup_status():
+    """
+    Get disk usage and cleanup status.
+
+    Returns:
+    - disk_usage: Current disk usage statistics
+    - managed_directories: Size of each managed directory
+    - last_cleanup: Last cleanup timestamp and stats
+    """
+    try:
+        disk_usage = temp_file_manager.get_disk_usage()
+
+        # Get sizes of managed directories
+        managed_dirs = {}
+        for dir_name, dir_path in [
+            ("outputs", temp_file_manager.output_dir),
+            ("screenshots", temp_file_manager.screenshot_dir),
+            ("envs", Path(HEXSTRIKE_ENVS_DIR)),
+            ("files", Path(HEXSTRIKE_FILES_DIR))
+        ]:
+            if dir_path.exists():
+                total_size = sum(f.stat().st_size for f in dir_path.rglob('*') if f.is_file())
+                file_count = sum(1 for f in dir_path.rglob('*') if f.is_file())
+                managed_dirs[dir_name] = {
+                    "path": str(dir_path),
+                    "size_mb": round(total_size / (1024 * 1024), 2),
+                    "file_count": file_count
+                }
+            else:
+                managed_dirs[dir_name] = {
+                    "path": str(dir_path),
+                    "size_mb": 0,
+                    "file_count": 0
+                }
+
+        return jsonify({
+            "disk_usage": disk_usage,
+            "managed_directories": managed_dirs,
+            "base_directory": str(temp_file_manager.base_dir),
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        logger.error(f"💥 Error getting cleanup status: {str(e)}")
+        return jsonify({"error": f"Failed to get status: {str(e)}"}), 500
 
 @app.route("/api/command", methods=["POST"])
 def generic_command():
@@ -10489,18 +10838,19 @@ def nuclei():
 @app.route("/api/tools/prowler", methods=["POST"])
 def prowler():
     """Execute Prowler for AWS security assessment"""
+    # v6.1: Use TempFileManager for automatic cleanup
+    output_dir = temp_file_manager.get_tool_output_dir("prowler")
+    auto_cleanup = True  # Default to cleanup
+
     try:
         params = request.json
         provider = params.get("provider", "aws")
         profile = params.get("profile", "default")
         region = params.get("region", "")
         checks = params.get("checks", "")
-        output_dir = params.get("output_dir", "/tmp/prowler_output")
         output_format = params.get("output_format", "json")
         additional_args = params.get("additional_args", "")
-
-        # Ensure output directory exists
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        auto_cleanup = params.get("auto_cleanup", True)  # v6.1: Auto cleanup option
 
         command = f"prowler {provider}"
 
@@ -10521,7 +10871,7 @@ def prowler():
 
         logger.info(f"☁️  Starting Prowler {provider} security assessment")
         result = execute_command(command)
-        result["output_directory"] = output_dir
+        result["output_directory"] = str(output_dir)
         logger.info(f"📊 Prowler assessment completed")
         return jsonify(result)
     except Exception as e:
@@ -10529,6 +10879,10 @@ def prowler():
         return jsonify({
             "error": f"Server error: {str(e)}"
         }), 500
+    finally:
+        # v6.1: Cleanup output directory after scan completion
+        if auto_cleanup:
+            temp_file_manager.cleanup_output(output_dir)
 
 @app.route("/api/tools/trivy", methods=["POST"])
 def trivy():
@@ -10581,14 +10935,19 @@ def trivy():
 @app.route("/api/tools/scout-suite", methods=["POST"])
 def scout_suite():
     """Execute Scout Suite for multi-cloud security assessment"""
+    # v6.1: Use TempFileManager for automatic cleanup
+    output_dir = temp_file_manager.get_tool_output_dir("scout_suite")
+    auto_cleanup = True  # Default to cleanup after scan
     try:
         params = request.json
         provider = params.get("provider", "aws")  # aws, azure, gcp, aliyun, oci
         profile = params.get("profile", "default")
-        report_dir = params.get("report_dir", "/tmp/scout-suite")
+        # v6.1: Use managed output directory instead of /tmp/scout-suite
+        report_dir = params.get("report_dir") or str(output_dir)
         services = params.get("services", "")
         exceptions = params.get("exceptions", "")
         additional_args = params.get("additional_args", "")
+        auto_cleanup = params.get("auto_cleanup", True)
 
         # Ensure report directory exists
         Path(report_dir).mkdir(parents=True, exist_ok=True)
@@ -10617,6 +10976,12 @@ def scout_suite():
     except Exception as e:
         logger.error(f"💥 Error in scout-suite endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+    finally:
+        # v6.1: Cleanup output directory after scan completion
+        if auto_cleanup:
+            cleanup_result = temp_file_manager.cleanup_output(output_dir)
+            if cleanup_result.get("success"):
+                logger.debug(f"🧹 Scout Suite output cleaned: {output_dir}")
 
 @app.route("/api/tools/cloudmapper", methods=["POST"])
 def cloudmapper():
@@ -10750,6 +11115,10 @@ def kube_hunter():
 @app.route("/api/tools/kube-bench", methods=["POST"])
 def kube_bench():
     """Execute kube-bench for CIS Kubernetes benchmark checks"""
+    # v6.1: Use TempFileManager for automatic cleanup
+    managed_output_dir = temp_file_manager.get_tool_output_dir("kube_bench")
+    auto_cleanup = True  # Default to cleanup after scan
+    output_file = None
     try:
         params = request.json
         targets = params.get("targets", "")  # master, node, etcd, policies
@@ -10757,6 +11126,7 @@ def kube_bench():
         config_dir = params.get("config_dir", "")
         output_format = params.get("output_format", "json")
         additional_args = params.get("additional_args", "")
+        auto_cleanup = params.get("auto_cleanup", True)
 
         command = "kube-bench"
 
@@ -10770,7 +11140,9 @@ def kube_bench():
             command += f" --config-dir {config_dir}"
 
         if output_format:
-            command += f" --outputfile /tmp/kube-bench-results.{output_format} --json"
+            # v6.1: Use managed output directory
+            output_file = managed_output_dir / f"kube-bench-results.{output_format}"
+            command += f" --outputfile {output_file} --json"
 
         if additional_args:
             command += f" {additional_args}"
@@ -10782,16 +11154,27 @@ def kube_bench():
     except Exception as e:
         logger.error(f"💥 Error in kube-bench endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+    finally:
+        # v6.1: Cleanup output directory after scan completion
+        if auto_cleanup:
+            cleanup_result = temp_file_manager.cleanup_output(managed_output_dir)
+            if cleanup_result.get("success"):
+                logger.debug(f"🧹 kube-bench output cleaned: {managed_output_dir}")
 
 @app.route("/api/tools/docker-bench-security", methods=["POST"])
 def docker_bench_security():
     """Execute Docker Bench for Security for Docker security assessment"""
+    # v6.1: Use TempFileManager for automatic cleanup
+    managed_output_dir = temp_file_manager.get_tool_output_dir("docker_bench")
+    auto_cleanup = True  # Default to cleanup after scan
     try:
         params = request.json
         checks = params.get("checks", "")  # Specific checks to run
         exclude = params.get("exclude", "")  # Checks to exclude
-        output_file = params.get("output_file", "/tmp/docker-bench-results.json")
+        # v6.1: Use managed output directory instead of /tmp
+        output_file = params.get("output_file") or str(managed_output_dir / "docker-bench-results.json")
         additional_args = params.get("additional_args", "")
+        auto_cleanup = params.get("auto_cleanup", True)
 
         command = "docker-bench-security"
 
@@ -10815,6 +11198,12 @@ def docker_bench_security():
     except Exception as e:
         logger.error(f"💥 Error in docker-bench-security endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+    finally:
+        # v6.1: Cleanup output directory after scan completion
+        if auto_cleanup:
+            cleanup_result = temp_file_manager.cleanup_output(managed_output_dir)
+            if cleanup_result.get("success"):
+                logger.debug(f"🧹 Docker Bench output cleaned: {managed_output_dir}")
 
 @app.route("/api/tools/clair", methods=["POST"])
 def clair():
@@ -11623,15 +12012,20 @@ def nmap_advanced():
 @app.route("/api/tools/autorecon", methods=["POST"])
 def autorecon():
     """Execute AutoRecon for comprehensive automated reconnaissance"""
+    # v6.1: Use TempFileManager for automatic cleanup
+    managed_output_dir = temp_file_manager.get_tool_output_dir("autorecon")
+    auto_cleanup = True  # Default to cleanup after scan
     try:
         params = request.json
         target = params.get("target", "")
-        output_dir = params.get("output_dir", "/tmp/autorecon")
+        # v6.1: Use managed output directory instead of /tmp/autorecon
+        output_dir = params.get("output_dir") or str(managed_output_dir)
         port_scans = params.get("port_scans", "top-100-ports")
         service_scans = params.get("service_scans", "default")
         heartbeat = params.get("heartbeat", 60)
         timeout = params.get("timeout", 300)
         additional_args = params.get("additional_args", "")
+        auto_cleanup = params.get("auto_cleanup", True)
 
         if not target:
             logger.warning("🎯 AutoRecon called without target parameter")
@@ -11655,6 +12049,12 @@ def autorecon():
     except Exception as e:
         logger.error(f"💥 Error in autorecon endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+    finally:
+        # v6.1: Cleanup output directory after scan completion
+        if auto_cleanup:
+            cleanup_result = temp_file_manager.cleanup_output(managed_output_dir)
+            if cleanup_result.get("success"):
+                logger.debug(f"🧹 AutoRecon output cleaned: {managed_output_dir}")
 
 @app.route("/api/tools/enum4linux-ng", methods=["POST"])
 def enum4linux_ng():
@@ -12254,6 +12654,9 @@ def objdump():
 @app.route("/api/tools/ghidra", methods=["POST"])
 def ghidra():
     """Execute Ghidra for advanced binary analysis and reverse engineering"""
+    # v6.1: Use TempFileManager for automatic cleanup
+    managed_output_dir = temp_file_manager.get_tool_output_dir("ghidra")
+    auto_cleanup = True  # Default to cleanup after analysis
     try:
         params = request.json
         binary = params.get("binary", "")
@@ -12262,13 +12665,14 @@ def ghidra():
         analysis_timeout = params.get("analysis_timeout", 300)
         output_format = params.get("output_format", "xml")
         additional_args = params.get("additional_args", "")
+        auto_cleanup = params.get("auto_cleanup", True)
 
         if not binary:
             logger.warning("🔧 Ghidra called without binary parameter")
             return jsonify({"error": "Binary parameter is required"}), 400
 
-        # Create Ghidra project directory
-        project_dir = f"/tmp/ghidra_projects/{project_name}"
+        # v6.1: Use managed output directory instead of /tmp/ghidra_projects
+        project_dir = str(managed_output_dir / project_name)
         os.makedirs(project_dir, exist_ok=True)
 
         # Base Ghidra command for headless analysis
@@ -12290,6 +12694,12 @@ def ghidra():
     except Exception as e:
         logger.error(f"💥 Error in ghidra endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+    finally:
+        # v6.1: Cleanup output directory after analysis completion
+        if auto_cleanup:
+            cleanup_result = temp_file_manager.cleanup_output(managed_output_dir)
+            if cleanup_result.get("success"):
+                logger.debug(f"🧹 Ghidra output cleaned: {managed_output_dir}")
 
 @app.route("/api/tools/pwntools", methods=["POST"])
 def pwntools():
@@ -13683,8 +14093,9 @@ class BrowserAgent:
             self.driver.get(url)
             time.sleep(wait_time)
 
-            # Take screenshot
-            screenshot_path = f"/tmp/hexstrike_screenshot_{int(time.time())}.png"
+            # Take screenshot (v6.1: Use managed screenshot directory)
+            Path(HEXSTRIKE_SCREENSHOT_DIR).mkdir(parents=True, exist_ok=True)
+            screenshot_path = f"{HEXSTRIKE_SCREENSHOT_DIR}/hexstrike_screenshot_{int(time.time())}.png"
             self.driver.save_screenshot(screenshot_path)
             self.screenshots.append(screenshot_path)
 
@@ -14186,7 +14597,9 @@ def browser_agent_endpoint():
                     400,
                 )
 
-            screenshot_path = f"/tmp/hexstrike_screenshot_{int(time.time())}.png"
+            # v6.1: Use managed screenshot directory
+            Path(HEXSTRIKE_SCREENSHOT_DIR).mkdir(parents=True, exist_ok=True)
+            screenshot_path = f"{HEXSTRIKE_SCREENSHOT_DIR}/hexstrike_screenshot_{int(time.time())}.png"
             browser_agent.driver.save_screenshot(screenshot_path)
 
             return jsonify(
@@ -15275,12 +15688,17 @@ def volatility3():
 @app.route("/api/tools/foremost", methods=["POST"])
 def foremost():
     """Execute Foremost for file carving with enhanced logging"""
+    # v6.1: Use TempFileManager for automatic cleanup
+    managed_output_dir = temp_file_manager.get_tool_output_dir("foremost")
+    auto_cleanup = True  # Default to cleanup after scan
     try:
         params = request.json
         input_file = params.get("input_file", "")
-        output_dir = params.get("output_dir", "/tmp/foremost_output")
+        # v6.1: Use managed output directory instead of /tmp/foremost_output
+        output_dir = params.get("output_dir") or str(managed_output_dir)
         file_types = params.get("file_types", "")
         additional_args = params.get("additional_args", "")
+        auto_cleanup = params.get("auto_cleanup", True)
 
         if not input_file:
             logger.warning("📁 Foremost called without input_file parameter")
@@ -15311,6 +15729,12 @@ def foremost():
         return jsonify({
             "error": f"Server error: {str(e)}"
         }), 500
+    finally:
+        # v6.1: Cleanup output directory after scan completion
+        if auto_cleanup:
+            cleanup_result = temp_file_manager.cleanup_output(managed_output_dir)
+            if cleanup_result.get("success"):
+                logger.debug(f"🧹 Foremost output cleaned: {managed_output_dir}")
 
 @app.route("/api/tools/steghide", methods=["POST"])
 def steghide():
