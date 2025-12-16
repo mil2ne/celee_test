@@ -279,6 +279,21 @@ class TempFileManager:
                     except Exception:
                         continue
 
+                # v6.1: Also clean Go tool caches from /tmp
+                import glob
+                for go_tool in ["nuclei", "katana", "httpx", "subfinder", "amass"]:
+                    pattern = f"/tmp/{go_tool}*"
+                    for dir_path in glob.glob(pattern):
+                        try:
+                            path = Path(dir_path)
+                            if path.is_dir():
+                                size = self._get_dir_size(path)
+                                shutil.rmtree(path)
+                                cleaned_count += 1
+                                cleaned_size += size
+                        except Exception:
+                            continue
+
                 logger.info(f"🚨 Emergency cleanup completed: {cleaned_count} items, {cleaned_size / 1024 / 1024:.2f} MB freed")
                 return {
                     "success": True,
@@ -322,6 +337,53 @@ class TempFileManager:
         except Exception:
             pass
         return total
+
+    def cleanup_go_tool_cache(self, tool_name: str) -> Dict[str, Any]:
+        """
+        Clean up Go-based tool caches from /tmp directory.
+        Tools like Nuclei, Katana, httpx create temp directories in /tmp.
+
+        Args:
+            tool_name: Name of the tool (nuclei, katana, httpx, etc.)
+
+        Returns:
+            Dict with cleanup statistics
+        """
+        import glob
+        cleaned_count = 0
+        cleaned_size = 0
+        errors = []
+
+        try:
+            # Pattern: /tmp/{tool_name}* (e.g., /tmp/nuclei1589610093)
+            pattern = f"/tmp/{tool_name}*"
+            matching_dirs = glob.glob(pattern)
+
+            for dir_path in matching_dirs:
+                try:
+                    path = Path(dir_path)
+                    if path.is_dir():
+                        size = self._get_dir_size(path)
+                        shutil.rmtree(path)
+                        cleaned_count += 1
+                        cleaned_size += size
+                        logger.debug(f"🧹 Cleaned {tool_name} cache: {dir_path}")
+                except Exception as e:
+                    errors.append(f"{dir_path}: {str(e)}")
+
+            if cleaned_count > 0:
+                logger.info(f"🧹 Cleaned {cleaned_count} {tool_name} cache dirs ({cleaned_size / 1024 / 1024:.2f} MB)")
+
+            return {
+                "success": True,
+                "tool": tool_name,
+                "cleaned_count": cleaned_count,
+                "cleaned_size_mb": round(cleaned_size / 1024 / 1024, 2),
+                "errors": errors if errors else None
+            }
+        except Exception as e:
+            logger.error(f"❌ Failed to cleanup {tool_name} cache: {e}")
+            return {"success": False, "tool": tool_name, "error": str(e)}
 
 
 # Initialize global TempFileManager instance
@@ -3794,7 +3856,7 @@ class CTFToolManager:
 
             # Forensics Investigation Tools
             "binwalk": "binwalk -e --dd='.*'",
-            "foremost": "foremost -i {} -o /tmp/foremost_output",
+            "foremost": f"foremost -i {{}} -o {HEXSTRIKE_OUTPUT_DIR}/foremost_output",
             "photorec": "photorec /log /cmd",
             "testdisk": "testdisk /log",
             "exiftool": "exiftool -all",
@@ -3812,7 +3874,7 @@ class CTFToolManager:
             "autopsy": "autopsy",
             "sleuthkit": "fls -r",
             "scalpel": "scalpel -c /etc/scalpel/scalpel.conf",
-            "bulk-extractor": "bulk_extractor -o /tmp/bulk_output",
+            "bulk-extractor": f"bulk_extractor -o {HEXSTRIKE_OUTPUT_DIR}/bulk_output",
             "ddrescue": "ddrescue",
             "dc3dd": "dc3dd",
 
@@ -9417,10 +9479,14 @@ def cleanup_temp_files():
         emergency = params.get("emergency", False)
         max_age_hours = params.get("max_age_hours", 24)
         tool_name = params.get("tool_name")
+        include_go_cache = params.get("include_go_cache", True)  # v6.1: Clean Go tool caches
 
         if emergency:
             logger.warning("🚨 Emergency cleanup triggered via API")
             result = temp_file_manager.emergency_cleanup()
+            # Also clean Go tool caches in emergency
+            for go_tool in ["nuclei", "katana", "httpx", "subfinder", "amass"]:
+                temp_file_manager.cleanup_go_tool_cache(go_tool)
         elif tool_name:
             logger.info(f"🧹 Cleanup triggered for tool: {tool_name}")
             tool_output_dir = temp_file_manager.output_dir / tool_name
@@ -9428,9 +9494,20 @@ def cleanup_temp_files():
                 result = temp_file_manager.cleanup_output(tool_output_dir)
             else:
                 result = {"success": True, "message": f"No output found for {tool_name}"}
+            # Also clean this tool's Go cache if applicable
+            temp_file_manager.cleanup_go_tool_cache(tool_name)
         else:
             logger.info(f"🧹 Cleanup triggered for files older than {max_age_hours} hours")
             result = temp_file_manager.cleanup_old_outputs(max_age_hours=max_age_hours)
+            # v6.1: Also clean Go tool caches from /tmp
+            if include_go_cache:
+                go_cleanup_results = []
+                for go_tool in ["nuclei", "katana", "httpx", "subfinder", "amass"]:
+                    go_result = temp_file_manager.cleanup_go_tool_cache(go_tool)
+                    if go_result.get("cleaned_count", 0) > 0:
+                        go_cleanup_results.append(go_result)
+                if go_cleanup_results:
+                    result["go_cache_cleanup"] = go_cleanup_results
 
         return jsonify(result)
     except Exception as e:
@@ -10823,10 +10900,16 @@ def nuclei():
             result = execute_command(command)
 
         logger.info(f"📊 Nuclei scan completed for {target}")
+
+        # v6.1: Cleanup Nuclei temp cache directories from /tmp
+        temp_file_manager.cleanup_go_tool_cache("nuclei")
+
         return jsonify(result)
 
     except Exception as e:
         logger.error(f"💥 Error in nuclei endpoint: {str(e)}")
+        # Cleanup even on error
+        temp_file_manager.cleanup_go_tool_cache("nuclei")
         return jsonify({
             "error": f"Server error: {str(e)}"
         }), 500
@@ -11043,8 +11126,9 @@ def pacu():
 
         commands.append("exit")
 
-        # Create command file
-        command_file = "/tmp/pacu_commands.txt"
+        # v6.1: Create command file in managed directory
+        Path(HEXSTRIKE_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+        command_file = f"{HEXSTRIKE_OUTPUT_DIR}/pacu_commands.txt"
         with open(command_file, "w") as f:
             f.write("\n".join(commands))
 
@@ -11455,8 +11539,9 @@ def metasploit():
             resource_content += f"set {key} {value}\n"
         resource_content += "exploit\n"
 
-        # Save resource script to a temporary file
-        resource_file = "/tmp/mcp_msf_resource.rc"
+        # v6.1: Save resource script to managed directory
+        Path(HEXSTRIKE_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+        resource_file = f"{HEXSTRIKE_OUTPUT_DIR}/mcp_msf_resource.rc"
         with open(resource_file, "w") as f:
             f.write(resource_content)
 
@@ -11742,9 +11827,14 @@ def amass():
         logger.info(f"🔍 Starting Amass {mode}: {domain}")
         result = execute_command(command)
         logger.info(f"📊 Amass completed for {domain}")
+
+        # v6.1: Cleanup Amass temp cache directories from /tmp
+        temp_file_manager.cleanup_go_tool_cache("amass")
+
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in amass endpoint: {str(e)}")
+        temp_file_manager.cleanup_go_tool_cache("amass")
         return jsonify({
             "error": f"Server error: {str(e)}"
         }), 500
@@ -11823,9 +11913,14 @@ def subfinder():
         logger.info(f"🔍 Starting Subfinder: {domain}")
         result = execute_command(command)
         logger.info(f"📊 Subfinder completed for {domain}")
+
+        # v6.1: Cleanup Subfinder temp cache directories from /tmp
+        temp_file_manager.cleanup_go_tool_cache("subfinder")
+
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in subfinder endpoint: {str(e)}")
+        temp_file_manager.cleanup_go_tool_cache("subfinder")
         return jsonify({
             "error": f"Server error: {str(e)}"
         }), 500
@@ -12379,7 +12474,9 @@ def gdb():
             command += f" -x {script_file}"
 
         if commands:
-            temp_script = "/tmp/gdb_commands.txt"
+            # v6.1: Use managed directory for temp script
+            Path(HEXSTRIKE_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+            temp_script = f"{HEXSTRIKE_OUTPUT_DIR}/gdb_commands.txt"
             with open(temp_script, "w") as f:
                 f.write(commands)
             command += f" -x {temp_script}"
@@ -12392,9 +12489,9 @@ def gdb():
         logger.info(f"🔧 Starting GDB analysis: {binary}")
         result = execute_command(command)
 
-        if commands and os.path.exists("/tmp/gdb_commands.txt"):
+        if commands and os.path.exists(f"{HEXSTRIKE_OUTPUT_DIR}/gdb_commands.txt"):
             try:
-                os.remove("/tmp/gdb_commands.txt")
+                os.remove(f"{HEXSTRIKE_OUTPUT_DIR}/gdb_commands.txt")
             except:
                 pass
 
@@ -12422,7 +12519,8 @@ def radare2():
             }), 400
 
         if commands:
-            temp_script = "/tmp/r2_commands.txt"
+            temp_script = f"{HEXSTRIKE_OUTPUT_DIR}/r2_commands.txt"
+            os.makedirs(HEXSTRIKE_OUTPUT_DIR, exist_ok=True)
             with open(temp_script, "w") as f:
                 f.write(commands)
             command = f"r2 -i {temp_script} -q {binary}"
@@ -12435,9 +12533,9 @@ def radare2():
         logger.info(f"🔧 Starting Radare2 analysis: {binary}")
         result = execute_command(command)
 
-        if commands and os.path.exists("/tmp/r2_commands.txt"):
+        if commands and os.path.exists(f"{HEXSTRIKE_OUTPUT_DIR}/r2_commands.txt"):
             try:
-                os.remove("/tmp/r2_commands.txt")
+                os.remove(f"{HEXSTRIKE_OUTPUT_DIR}/r2_commands.txt")
             except:
                 pass
 
@@ -12718,7 +12816,8 @@ def pwntools():
             return jsonify({"error": "Script content or target binary is required"}), 400
 
         # Create temporary Python script
-        script_file = "/tmp/pwntools_exploit.py"
+        os.makedirs(HEXSTRIKE_OUTPUT_DIR, exist_ok=True)
+        script_file = f"{HEXSTRIKE_OUTPUT_DIR}/pwntools_exploit.py"
 
         if script_content:
             # Use provided script content
@@ -12872,7 +12971,8 @@ def gdb_peda():
 
         # Create command script
         if commands:
-            temp_script = "/tmp/gdb_peda_commands.txt"
+            os.makedirs(HEXSTRIKE_OUTPUT_DIR, exist_ok=True)
+            temp_script = f"{HEXSTRIKE_OUTPUT_DIR}/gdb_peda_commands.txt"
             peda_commands = f"""
 source ~/peda/peda.py
 {commands}
@@ -12893,9 +12993,9 @@ quit
         result = execute_command(command)
 
         # Cleanup
-        if commands and os.path.exists("/tmp/gdb_peda_commands.txt"):
+        if commands and os.path.exists(f"{HEXSTRIKE_OUTPUT_DIR}/gdb_peda_commands.txt"):
             try:
-                os.remove("/tmp/gdb_peda_commands.txt")
+                os.remove(f"{HEXSTRIKE_OUTPUT_DIR}/gdb_peda_commands.txt")
             except:
                 pass
 
@@ -12922,7 +13022,8 @@ def angr():
             return jsonify({"error": "Binary parameter is required"}), 400
 
         # Create angr script
-        script_file = "/tmp/angr_analysis.py"
+        os.makedirs(HEXSTRIKE_OUTPUT_DIR, exist_ok=True)
+        script_file = f"{HEXSTRIKE_OUTPUT_DIR}/angr_analysis.py"
 
         if script_content:
             with open(script_file, "w") as f:
@@ -13279,9 +13380,15 @@ def katana():
         logger.info(f"⚔️  Starting Katana crawl: {url}")
         result = execute_command(command)
         logger.info(f"📊 Katana crawl completed for {url}")
+
+        # v6.1: Cleanup Katana temp cache directories from /tmp
+        temp_file_manager.cleanup_go_tool_cache("katana")
+
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in katana endpoint: {str(e)}")
+        # Cleanup even on error
+        temp_file_manager.cleanup_go_tool_cache("katana")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/gau", methods=["POST"])
@@ -13587,9 +13694,14 @@ def httpx():
         logger.info(f"🌍 Starting httpx probe: {target}")
         result = execute_command(command)
         logger.info(f"📊 httpx probe completed for {target}")
+
+        # v6.1: Cleanup httpx temp cache directories from /tmp
+        temp_file_manager.cleanup_go_tool_cache("httpx")
+
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in httpx endpoint: {str(e)}")
+        temp_file_manager.cleanup_go_tool_cache("httpx")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/anew", methods=["POST"])
@@ -16890,7 +17002,7 @@ def ctf_forensics_analyzer():
                     elif tool == "zsteg":
                         steg_result = subprocess.run([tool, '-a', file_path], capture_output=True, text=True, timeout=30)
                     elif tool == "outguess":
-                        steg_result = subprocess.run([tool, '-r', file_path, '/tmp/outguess_output'], capture_output=True, text=True, timeout=30)
+                        steg_result = subprocess.run([tool, '-r', file_path, f'{HEXSTRIKE_OUTPUT_DIR}/outguess_output'], capture_output=True, text=True, timeout=30)
 
                     if steg_result.returncode == 0 and steg_result.stdout.strip():
                         results["steganography_results"].append({
